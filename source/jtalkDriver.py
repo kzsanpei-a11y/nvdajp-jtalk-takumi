@@ -1,0 +1,568 @@
+# jtalkDriver.py
+# A part of NonVisual Desktop Access (NVDA)
+# speech engine nvdajp_jtalk
+# Copyright (C) 2010-2019 Takuya Nishimoto (nishimotz.com)
+
+from logHandler import log
+from typing import Any, cast
+from collections.abc import Callable
+
+import queue as Queue
+
+
+import baseObject
+import copy
+import nvwave
+from pathlib import Path
+
+from .jtalkCore import (
+	libjt_initialize,
+	libjt_load,
+	libjt_refresh,
+	libjt_set_alpha,
+	libjt_set_beta,
+	libjt_set_on_done,
+	libjt_synthesis,
+	libjt_version,
+)
+from .mecab import (
+	mecab,
+	Mecab_initialize,
+	Mecab_print,
+	Mecab_splitFeatures,
+	Mecab_utf8_to_cp932,
+	mecab_analyze_and_correct,
+)
+from .text2mecab import text2mecab
+from . import jtalkPrepare
+from ..jtalk._nvdajp_unicode import unicode_normalize
+from ..jtalk import _bgthread
+import config
+from .jtalkDir import jtalk_dir, dic_dir, user_dics
+
+DEBUG = False
+
+RATE_BOOST_MULTIPLIER = 1.5
+
+# math.log(150) = 5.0, math.log(350) = 5.9
+_jtalk_voices = [
+	{
+		"id": "V1",
+		"name": "m001",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.0,
+		"pitch_bias": 0,
+		"speaker_attenuation": 1.0,
+		"htsvoice": str(jtalk_dir / "m001" / "m001.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V2",
+		"name": "mei",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.9,
+		"pitch_bias": -25,
+		"inflection_bias": -10,
+		"speaker_attenuation": 0.8,
+		"htsvoice": str(jtalk_dir / "mei" / "mei_happy.htsvoice"),
+		"alpha": 0.60,  # 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V3",
+		"name": "lite",
+		"lang": "ja",
+		"samp_rate": 16000,
+		"fperiod": 80,
+		"lf0_base": 5.0,
+		"pitch_bias": 0,
+		"speaker_attenuation": 1.0,
+		"htsvoice": str(jtalk_dir / "lite" / "voice.htsvoice"),
+		"alpha": 0.42,
+		"beta": 0.00,
+	},
+	{
+		"id": "V4",
+		"name": "tohoku-f01",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"fperiod_bias": 0.75,
+		"lf0_base": 5.9,
+		"pitch_bias": 0,
+		"inflection_bias": 0,
+		"speaker_attenuation": 0.8,
+		"htsvoice": str(jtalk_dir / "tohokuf01" / "tohoku-f01-neutral.htsvoice"),
+		"alpha": 0.54,
+		"beta": 0.00,
+	},
+	{
+		"id": "V5",
+		"name": "takumi",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.0,
+		"pitch_bias": 0,
+		"speaker_attenuation": 1.0,
+		"htsvoice": str(jtalk_dir / "takumi" / "takumi_normal.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V6",
+		"name": "takumi_happy",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.0,
+		"pitch_bias": 0,
+		"speaker_attenuation": 1.0,
+		"htsvoice": str(jtalk_dir / "takumi" / "takumi_happy.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V7",
+		"name": "takumi_angry",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.0,
+		"pitch_bias": 0,
+		"speaker_attenuation": 1.0,
+		"htsvoice": str(jtalk_dir / "takumi" / "takumi_angry.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V8",
+		"name": "takumi_sad",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.0,
+		"pitch_bias": 0,
+		"speaker_attenuation": 1.0,
+		"htsvoice": str(jtalk_dir / "takumi" / "takumi_sad.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V9",
+		"name": "mei_happy",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.9,
+		"pitch_bias": -25,
+		"inflection_bias": -10,
+		"speaker_attenuation": 0.8,
+		"htsvoice": str(jtalk_dir / "mei_emotions" / "mei_happy.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V10",
+		"name": "mei_angry",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.9,
+		"pitch_bias": -25,
+		"inflection_bias": -10,
+		"speaker_attenuation": 0.8,
+		"htsvoice": str(jtalk_dir / "mei_emotions" / "mei_angry.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V11",
+		"name": "mei_sad",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.9,
+		"pitch_bias": -25,
+		"inflection_bias": -10,
+		"speaker_attenuation": 0.8,
+		"htsvoice": str(jtalk_dir / "mei_emotions" / "mei_sad.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+	{
+		"id": "V12",
+		"name": "mei_bashful",
+		"lang": "ja",
+		"samp_rate": 48000,
+		"fperiod": 240,
+		"lf0_base": 5.9,
+		"pitch_bias": -25,
+		"inflection_bias": -10,
+		"speaker_attenuation": 0.8,
+		"htsvoice": str(jtalk_dir / "mei_emotions" / "mei_bashful.htsvoice"),
+		"alpha": 0.55,
+		"beta": 0.00,
+	},
+]
+default_jtalk_voice = _jtalk_voices[3]  # V4
+voice_args: dict[str, Any] | None = None
+
+
+class VoiceProperty(baseObject.AutoPropertyObject):
+	def __init__(self):
+		super().__init__()
+
+
+# if samp_rate==16000: normal speed = 80samples period
+fperiod: int = 240
+
+# gain control
+max_level: int = 32000
+thres_level: int = 128
+thres2_level: int = 128
+speaker_attenuation: float = 1.0
+
+logwrite: Callable[[str], None] = log.debug
+lastIndex: int | None = None
+currIndex: int | None = None
+player: nvwave.WavePlayer | None = None
+# 0: idle, 2: JTalk or silence. Value 1 belonged to the removed eSpeak
+# bridge; 2 is kept as is so that log output stays comparable.
+currentEngine: int = 0
+indexReachedFunc: Callable[[int | None], None] | None = None
+
+
+def isSpeaking() -> bool:
+	return _bgthread.isSpeaking
+
+
+def setSpeaking(b: bool) -> None:
+	_bgthread.isSpeaking = b
+
+
+def _jtalk_speak(msg: str, index: int | None = None, prop: Any = None) -> None:
+	global currIndex
+	global currentEngine
+	global lastIndex
+	global voice_args
+	global player
+	# log.info("index %r msg(%s) start" % (index, msg))
+	if prop is None:
+		return
+	assert voice_args is not None  # Type narrowing for type checkers
+	assert player is not None  # Type narrowing for type checkers
+	currIndex = index
+	if prop.characterMode:
+		fperiod_current = voice_args["fperiod"]
+	else:
+		fperiod_current = fperiod
+	msg = unicode_normalize(msg)
+	msg = jtalkPrepare.convert(msg)
+	lw = None
+	if DEBUG:
+		lw = logwrite
+	setSpeaking(True)
+	currentEngine = 2
+	if DEBUG:
+		logwrite("p:%d i:%d msg:%s" % (prop.pitch, prop.inflection, msg))
+	level = int(max_level * speaker_attenuation)
+	la = 0.020 * (prop.inflection + voice_args.get("inflection_bias", 0))  # 50 = original range
+	ls = 0.015 * (prop.pitch - 50.0 + voice_args["pitch_bias"])  # 50 = no shift
+	lo = ls + voice_args["lf0_base"] * (1 - la)
+	if DEBUG:
+		logwrite("lo:%f la:%f" % (lo, la))
+	lastIndex = currIndex
+	currIndex = None
+	for t in msg.split():
+		if DEBUG:
+			logwrite("unicode (%s)" % t)
+		s = text2mecab(t)
+		if DEBUG:
+			logwrite("utf-8 (%s)" % s.decode("utf-8", "ignore"))
+		if not isSpeaking():
+			libjt_refresh()
+			return
+		mf = mecab_analyze_and_correct(s, logwrite_=logwrite)
+		if DEBUG:
+			Mecab_print(mf, logwrite)
+		ar = Mecab_splitFeatures(mf, CODE_="utf-8")
+		for a in ar:
+			if isSpeaking():
+				if DEBUG:
+					Mecab_print(a, logwrite, CODE_="utf-8")
+				Mecab_utf8_to_cp932(a)
+				if DEBUG:
+					logwrite("Mecab_analysis done")
+				libjt_synthesis(
+					a.feature,
+					a.size,
+					fperiod_=fperiod_current,
+					feed_func_=player.feed,  # player.feed() is called inside
+					is_speaking_func_=isSpeaking,
+					begin_thres_=thres_level,
+					end_thres_=thres2_level,
+					level_=level,
+					logwrite_=lw,
+					lf0_offset_=lo,
+					lf0_amp_=la,
+				)
+				libjt_refresh()
+				if DEBUG:
+					logwrite("libjt_synthesis done")
+			del a
+		del mf
+	player.idle()
+	# log.info('player.idle done. lastIndex %r' % lastIndex)
+	setSpeaking(False)
+	currentEngine = 0
+
+
+# call from BgThread
+def _speak(arg: tuple[str, str, int | None, Any]) -> None:
+	msg, lang, index, prop = arg
+	if DEBUG:
+		logwrite("[" + lang + "]" + str(msg))
+	if DEBUG:
+		logwrite("_speak(%s)" % str(msg))
+	# JTalk speaks every language segment. The eSpeak bridge that used to
+	# handle non-Japanese segments here was removed; see
+	# projectDocs/jp/espeak-bridge-removal.md and nvdajp issue #6.
+	_jtalk_speak(str(msg), index, prop)
+
+
+def _break(time_ms: int) -> None:
+	"""Feed silence for time_ms milliseconds (runs in background thread)."""
+	global currentEngine
+	global player
+	global voice_args
+	if player is None or voice_args is None:
+		return
+	if time_ms <= 0:
+		return
+	setSpeaking(True)
+	currentEngine = 2
+	# 16-bit mono: 2 bytes per sample
+	samp_rate = voice_args["samp_rate"]
+	num_samples = int(time_ms / 1000.0 * samp_rate)
+	silence = (b"\x00\x00") * num_samples
+	player.feed(silence)
+	player.idle()
+	setSpeaking(False)
+	currentEngine = 0
+
+
+indexCommands: list[int] = []
+lastIndexCommand: int | None = None
+
+
+def _processIndexReached() -> None:
+	global indexCommands
+	flag = False
+	indexCommandsNew = []
+	for item in indexCommands:
+		if indexReachedFunc and (lastIndex is None or item <= lastIndex):
+			indexReachedFunc(item)
+			flag = True
+		else:
+			indexCommandsNew.append(item)
+	if flag:
+		indexCommands = indexCommandsNew
+		# log.info("lastIndex %r indexCommands %r" % (lastIndex, indexCommands))
+
+
+# call from BgThread
+def _updateSpeakIndex(index: int) -> None:
+	global currIndex
+	global lastIndex
+	assert indexReachedFunc is not None  # Type narrowing for type checkers
+	lastIndex = currIndex = index
+	# log.info("lastIndex %r" % lastIndex)
+	_processIndexReached()
+	if not indexCommands:
+		indexReachedFunc(None)
+
+
+# call from nvdajp_jtalk.py
+def updateIndex(index: int) -> None:
+	global lastIndex, indexCommands
+	lastIndex = index
+	indexCommands.append(index)
+	# log.info("index %r indexCommands %r" % (index, indexCommands))
+
+
+def onJtalkDone() -> None:
+	# log.info("onJtalkDone")
+	_processIndexReached()
+
+
+def speak(msg: str, lang: str, index: int | None = None, voiceProperty_: Any = None) -> None:
+	# log.info("index(%r) msg(%s) lang(%s)" % (index, msg, lang))
+	# if msg is None and lang is None:
+	# 	import tones
+	# 	tones.beep(440, 10)
+	# 	_bgthread.execWhenDone(_updateSpeakIndex, index, mustBeAsync=True)
+	# 	return
+	msg = msg.strip()
+	if len(msg) == 0:
+		return
+	if voiceProperty_ is None:
+		return
+	arg = [msg, lang, index, copy.deepcopy(voiceProperty_)]
+	_bgthread.execWhenDone(_speak, arg, mustBeAsync=True)
+
+
+def updateSpeakIndexWhenDone(index: int) -> None:
+	# import tones
+	# tones.beep(440, 10)
+	_bgthread.execWhenDone(_updateSpeakIndex, index, mustBeAsync=True)
+
+
+def speak_break(time_ms: int) -> None:
+	"""Queue a break (silence) of time_ms milliseconds. Called from nvdajp_jtalk."""
+	if time_ms <= 0:
+		return
+	# Clamp to a reasonable range (0–5 seconds)
+	time_ms = min(max(time_ms, 0), 5000)
+	_bgthread.execWhenDone(_break, time_ms, mustBeAsync=True)
+
+
+def stop() -> None:
+	global currentEngine, indexCommands, lastIndex
+	# Need player and queue to drain and stop JTalk.
+	if player is None or _bgthread.bgQueue is None:
+		return
+	if indexReachedFunc:
+		for item in indexCommands:
+			indexReachedFunc(item)
+
+		indexCommands.clear()
+
+		indexReachedFunc(None)
+	# Kill all speech from now.
+	# We still want parameter changes to occur, so requeue them.
+	params = []
+	stop_task_count = 0  # for log.info()
+	try:
+		while True:
+			item = _bgthread.bgQueue.get_nowait()  # [func, args, kwargs]
+			if item[0] not in (_speak, _break):
+				params.append(item)
+			else:
+				stop_task_count = stop_task_count + 1
+			_bgthread.bgQueue.task_done()
+	except Queue.Empty:
+		# Let the exception break us out of this loop, as queue.empty() is not reliable anyway.
+		pass
+	for item in params:
+		_bgthread.bgQueue.put(item)
+	setSpeaking(False)
+	if DEBUG:
+		logwrite("stop: %d task(s) stopping" % stop_task_count)
+	player.stop()
+	lastIndex = None
+
+
+def pause(switch: bool) -> None:
+	if currentEngine == 2 and player is not None:
+		player.pause(switch)
+
+
+def initialize(
+	voice: dict[str, Any] = default_jtalk_voice,
+	onIndexReached: Callable[[int | None], None] | None = None,
+) -> None:
+	global player, voice_args
+	global speaker_attenuation
+	global indexReachedFunc
+	indexReachedFunc = onIndexReached
+	voice_args = voice
+	assert voice_args is not None  # Type narrowing for type checkers
+	speaker_attenuation = voice_args["speaker_attenuation"]
+	if not player:
+		audio_config = cast(dict[str, Any], config.conf["audio"])
+		player = nvwave.WavePlayer(
+			channels=1,
+			samplesPerSec=voice_args["samp_rate"],
+			bitsPerSample=16,
+			outputDevice=str(audio_config["outputDevice"]),
+		)
+	if not _bgthread.bgThread:
+		_bgthread.initialize()
+	if not mecab:
+		Mecab_initialize(logwrite, jtalk_dir, dic_dir, user_dics)
+	jtalkPrepare.setup()
+
+	jt_dll = str(jtalk_dir / "libopenjtalk.dll")
+	log.debug("jt_dll %s" % jt_dll)
+	libjt_initialize(jt_dll)
+	libjt_set_on_done(onJtalkDone)
+	log.debug(libjt_version())
+
+	if Path(voice_args["htsvoice"]).is_file():
+		libjt_load(voice_args["htsvoice"])
+		# log.info("loaded " + voice_args['htsvoice'])
+	else:
+		log.error("load error " + voice_args["htsvoice"])
+	libjt_set_alpha(voice_args["alpha"])
+	libjt_set_beta(voice_args["beta"])
+
+
+def terminate() -> None:
+	global player
+	stop()
+	# Ensure playback stops and queue is drained so _bgthread.terminate() does not hang:
+	# stop() may have returned early when player/bgQueue was None; the background
+	# thread might still be in _speak() or have items in the queue. We must stop playback
+	# and drain _speak items before joining the thread.
+	if _bgthread.bgQueue is not None:
+		params = []
+		try:
+			while True:
+				item = _bgthread.bgQueue.get_nowait()
+				if item[0] not in (_speak, _break):
+					params.append(item)
+				_bgthread.bgQueue.task_done()
+		except Queue.Empty:
+			pass
+		for item in params:
+			_bgthread.bgQueue.put(item)
+	if player is not None:
+		player.stop()
+	_bgthread.terminate()
+	if player is not None:
+		player.close()
+		player = None
+
+
+rate_percent: int = 50
+
+
+def get_rate(rateBoost: bool) -> int:
+	return rate_percent
+
+
+def set_rate(rate: int, rateBoost: bool) -> None:
+	global fperiod, rate_percent
+	global voice_args
+	assert voice_args is not None  # Type narrowing for type checkers
+	rate_percent = rate
+	if voice_args["samp_rate"] == 16000:
+		fperiod = int(80 - int(rate) / 2)  # 80..30
+	if voice_args["samp_rate"] == 48000:
+		fperiod = int(240 - 1.5 * int(rate))  # 240..90
+	if not rateBoost:
+		fperiod = int(fperiod * RATE_BOOST_MULTIPLIER)
+	fperiod = int(fperiod * voice_args.get("fperiod_bias", 1))
+
+
+def set_volume(vol: int) -> None:
+	global max_level, thres_level, thres2_level
+	max_level = int(326.67 * int(vol) + 100)  # 100..32767
+	thres_level = 128
+	thres2_level = 128
